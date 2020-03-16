@@ -13,17 +13,20 @@ pub mod std {
 
 pub mod path {
     #[cfg(feature = "std")]
-    pub use crate::std::path::{Path, PathBuf};
+    pub use crate::std::path::{Iter, Path, PathBuf};
 
     #[cfg(not(feature = "std"))]
     pub struct Path {}
 
     #[cfg(not(feature = "std"))]
     pub struct PathBuf {}
+
+    #[cfg(not(feature = "std"))]
+    pub struct Iter {}
 }
 use path::*;
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, PartialEq, Debug)]
 pub enum FoldyError {
     #[error("lol")]
     FileNotFound,
@@ -33,16 +36,8 @@ pub enum FoldyError {
     InvalidPath,
     #[error("lol")]
     EOF,
-    #[cfg(feature = "std")]
-    #[error("lol")]
-    IoError(std::io::Error),
 }
-#[cfg(feature = "std")]
-impl From<std::io::Error> for FoldyError {
-    fn from(err: std::io::Error) -> Self {
-        Self::IoError(err)
-    }
-}
+
 #[cfg(feature = "std")]
 impl Into<std::io::Error> for FoldyError {
     fn into(self) -> std::io::Error {
@@ -52,7 +47,9 @@ impl Into<std::io::Error> for FoldyError {
 
 pub mod memory;
 
-pub struct DirEntry {}
+pub struct DirEntry {
+    path: PathBuf,
+}
 impl DirEntry {
     fn path(&self) -> PathBuf {
         unimplemented!()
@@ -73,9 +70,9 @@ pub trait File {}
 pub trait Source<'a> {
     type DirIter: 'a + Iterator<Item = Result<DirEntry, FoldyError>>;
 
-    fn read_dir<P>(&'a self, path: P) -> Option<Self::DirIter>
+    fn read_dir<P>(&'a self, path: P) -> Result<Self::DirIter, FoldyError>
     where
-        P: AsRef<Path>,
+        P: 'a + AsRef<Path>,
         Self: Sized;
 
     fn create_dir<P>(&mut self, path: P) -> Result<(), FoldyError>

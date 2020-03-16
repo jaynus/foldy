@@ -3,15 +3,61 @@ use crate::{DirEntry, File, FoldyError, Source};
 #[cfg(not(feature = "std"))]
 use crate::std;
 
+use crate::FoldyError::DirectoryNotFound;
 use crate::{
-    path::*,
+    path::{Iter as PathIter, Path, PathBuf},
     std::collections::{HashMap, HashSet},
 };
 
 #[derive(Debug, Clone)]
 pub enum MemoryEntry {
     File(MemoryFile),
-    Directory(HashMap<String, MemoryEntry>),
+    Directory(HashMap<PathBuf, MemoryEntry>),
+}
+impl MemoryEntry {
+    pub fn visit_mut(&mut self, mut path: &Path) -> Result<&mut MemoryEntry, FoldyError> {
+        if path.starts_with("/") {
+            path = path
+                .strip_prefix("/")
+                .map_err(|_| FoldyError::InvalidPath)?;
+        }
+
+        let mut iter = path.iter();
+        if let Some(part) = iter.next() {
+            let path = Path::new(part);
+            match self {
+                MemoryEntry::Directory(map) => map
+                    .get_mut(path)
+                    .ok_or(FoldyError::DirectoryNotFound)?
+                    .visit_mut(iter.as_path()),
+                _ => Err(FoldyError::InvalidPath),
+            }
+        } else {
+            Ok(self)
+        }
+    }
+
+    pub fn visit(&self, mut path: &Path) -> Result<&MemoryEntry, FoldyError> {
+        if path.starts_with("/") {
+            path = path
+                .strip_prefix("/")
+                .map_err(|_| FoldyError::InvalidPath)?;
+        }
+
+        let mut iter = path.iter();
+        if let Some(part) = iter.next() {
+            let path = Path::new(part);
+            match self {
+                MemoryEntry::Directory(map) => map
+                    .get(path)
+                    .ok_or(FoldyError::DirectoryNotFound)?
+                    .visit(iter.as_path()),
+                _ => Err(FoldyError::InvalidPath),
+            }
+        } else {
+            Ok(self)
+        }
+    }
 }
 
 #[derive(Default, Clone)]
@@ -156,54 +202,26 @@ impl Default for MemorySource {
         }
     }
 }
-impl MemorySource {
-    fn dir_entry(&self, path: &Path) -> Result<&MemoryEntry, FoldyError> {
-        let mut entry_ref = &self.root;
-        for dir in path.parent().iter() {
-            if dir.as_os_str().len() < 1 || dir.as_os_str() == std::ffi::OsStr::new("/") {
-                continue;
-            }
-            match entry_ref {
-                MemoryEntry::Directory(map) => {
-                    entry_ref = map
-                        .get(dir.as_os_str().to_str().ok_or(FoldyError::InvalidPath)?)
-                        .ok_or(FoldyError::DirectoryNotFound)?;
-                }
-                _ => return Err(FoldyError::InvalidPath),
-            }
-        }
-
-        Ok(entry_ref)
-    }
-
-    fn dir_entry_mut(&mut self, path: &Path) -> Result<&mut MemoryEntry, FoldyError> {
-        let mut entry_ref = &mut self.root;
-        for dir in path.parent().iter() {
-            if dir.as_os_str().len() < 1 || dir.as_os_str() == std::ffi::OsStr::new("/") {
-                continue;
-            }
-            match entry_ref {
-                MemoryEntry::Directory(map) => {
-                    entry_ref = map
-                        .get_mut(dir.as_os_str().to_str().ok_or(FoldyError::InvalidPath)?)
-                        .ok_or(FoldyError::DirectoryNotFound)?;
-                }
-                _ => return Err(FoldyError::InvalidPath),
-            }
-        }
-
-        Ok(entry_ref)
-    }
-}
+impl MemorySource {}
 impl<'a> Source<'a> for MemorySource {
-    type DirIter = MemoryDirIter<'a>;
+    type DirIter = MemoryDirIter<'a, std::collections::hash_map::Iter<'a, PathBuf, MemoryEntry>>;
 
-    fn read_dir<P>(&'a self, path: P) -> Option<Self::DirIter>
+    fn read_dir<P>(&'a self, path: P) -> Result<Self::DirIter, FoldyError>
     where
-        P: AsRef<Path>,
+        P: 'a + AsRef<Path>,
         Self: Sized,
     {
-        None
+        match self
+            .root
+            .visit(path.as_ref().parent().unwrap_or(Path::new("")))?
+        {
+            MemoryEntry::File(_) => Err(FoldyError::InvalidPath),
+            MemoryEntry::Directory(ref map) => Ok(MemoryDirIter {
+                iter: map.iter(),
+                root: path.as_ref().to_path_buf(),
+                _marker: std::marker::PhantomData::default(),
+            }),
+        }
     }
 
     fn create_dir<P>(&mut self, path: P) -> Result<(), FoldyError>
@@ -212,21 +230,18 @@ impl<'a> Source<'a> for MemorySource {
         Self: Sized,
     {
         let path = path.as_ref();
-        let filename = path.file_name().ok_or(FoldyError::InvalidPath)?;
+        let parent = self.root.visit_mut(path.parent().unwrap())?;
+        let filename = &path.file_name().ok_or(FoldyError::InvalidPath)?;
+        let end_path = Path::new(filename);
 
-        match self.dir_entry_mut(path)? {
-            MemoryEntry::Directory(map) => map
-                .entry(
-                    filename
-                        .to_str()
-                        .ok_or(FoldyError::InvalidPath)?
-                        .to_string(),
-                )
-                .or_insert_with(|| MemoryEntry::Directory(HashMap::default())),
-            _ => unreachable!(),
-        };
-
-        Ok(())
+        match parent {
+            MemoryEntry::File(_) => Err(FoldyError::InvalidPath),
+            MemoryEntry::Directory(ref mut map) => {
+                map.entry(end_path.to_path_buf())
+                    .or_insert_with(|| MemoryEntry::Directory(HashMap::default()));
+                Ok(())
+            }
+        }
     }
 
     fn remove_dir<P>(&mut self, path: P) -> Result<(), FoldyError>
@@ -242,21 +257,10 @@ impl<'a> Source<'a> for MemorySource {
         P: AsRef<Path>,
         Self: Sized,
     {
-        let path = path.as_ref();
-
-        let filename = path.file_name().ok_or(FoldyError::InvalidPath)?;
-
-        match self.dir_entry(path)? {
-            MemoryEntry::Directory(map) => {
-                match map
-                    .get(filename.to_str().ok_or(FoldyError::InvalidPath)?)
-                    .ok_or(FoldyError::DirectoryNotFound)?
-                {
-                    MemoryEntry::File(ref file) => Ok(file),
-                    _ => Err(FoldyError::FileNotFound),
-                }
-            }
-            _ => Err(FoldyError::FileNotFound),
+        let entry = self.root.visit(path.as_ref())?;
+        match entry {
+            MemoryEntry::File(ref file) => Ok(file),
+            _ => Err(FoldyError::InvalidPath),
         }
     }
 
@@ -266,42 +270,52 @@ impl<'a> Source<'a> for MemorySource {
         Self: Sized,
     {
         let path = path.as_ref();
+        let parent = self.root.visit_mut(path.parent().unwrap())?;
+        let filename = &path.file_name().ok_or(FoldyError::InvalidPath)?;
+        let end_path = Path::new(filename);
 
-        let filename = path.file_name().ok_or(FoldyError::InvalidPath)?;
-
-        match self.dir_entry_mut(path)? {
-            MemoryEntry::Directory(map) => {
-                let file = map
-                    .entry(
-                        filename
-                            .to_str()
-                            .ok_or(FoldyError::InvalidPath)?
-                            .to_string(),
-                    )
-                    .or_insert_with(|| MemoryEntry::File(MemoryFile::default()));
-                match file {
-                    MemoryEntry::File(ref mut file) => Ok(file),
-                    _ => unreachable!(),
-                }
-            }
-            _ => Err(FoldyError::FileNotFound),
+        match parent {
+            MemoryEntry::File(_) => Err(FoldyError::InvalidPath),
+            MemoryEntry::Directory(ref mut map) => Ok(
+                match map
+                    .entry(end_path.to_path_buf())
+                    .or_insert_with(|| MemoryEntry::File(MemoryFile::default()))
+                {
+                    MemoryEntry::File(ref mut file) => file,
+                    MemoryEntry::Directory(_) => unreachable!(),
+                },
+            ),
         }
     }
 }
 
-pub struct MemoryDirIter<'a> {
-    src: &'a MemorySource,
+pub struct MemoryDirIter<'a, I> {
+    root: PathBuf,
+    iter: I,
+    _marker: std::marker::PhantomData<&'a ()>,
 }
-impl<'a> Iterator for MemoryDirIter<'a> {
+impl<'a, I> Iterator for MemoryDirIter<'a, I>
+where
+    I: Iterator<Item = (&'a PathBuf, &'a MemoryEntry)> + ExactSizeIterator,
+{
     type Item = Result<DirEntry, FoldyError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        None
+        if let Some(next) = self.iter.next() {
+            Some(Ok(DirEntry {
+                path: self.root.join(next.0).to_path_buf(),
+            }))
+        } else {
+            None
+        }
     }
 }
-impl<'a> ExactSizeIterator for MemoryDirIter<'a> {
+impl<'a, I> ExactSizeIterator for MemoryDirIter<'a, I>
+where
+    I: Iterator<Item = (&'a PathBuf, &'a MemoryEntry)> + ExactSizeIterator,
+{
     fn len(&self) -> usize {
-        0
+        self.iter.len()
     }
 }
 
@@ -310,22 +324,38 @@ mod test {
     use super::*;
 
     #[test]
-    fn read_dir() {}
+    fn read_dir() {
+        let mut source = MemorySource::default();
+        source.create_dir("/a1").unwrap();
+        source.create_dir("/b2").unwrap();
+        source.create_dir("/c3").unwrap();
+        let iter = source.read_dir("/").unwrap();
+        assert_eq!(iter.len(), 3);
+    }
 
     #[test]
     fn source_file_lookup() {
         let mut source = MemorySource::default();
-        assert!(source.open("balls").is_err());
+        assert_eq!(
+            source.open("balls").err().unwrap(),
+            FoldyError::DirectoryNotFound
+        );
 
         source.open_mut("balls").unwrap();
         source.open("balls").unwrap();
         source.open("/balls").unwrap();
 
-        source.create_dir("/asdf/").unwrap();
+        source.create_dir("/asdf").unwrap();
+
+        assert_eq!(source.open("/asdf").err().unwrap(), FoldyError::InvalidPath);
 
         source.open_mut("/asdf/123").unwrap();
-        source.open("asdf/123").unwrap();
         source.open("/asdf/123").unwrap();
+        source.open("/asdf/123").unwrap();
+
+        source.create_dir("/asdf/abc").unwrap();
+        source.open_mut("/asdf/abc/fff").unwrap();
+        source.open("/asdf/abc/fff").unwrap();
     }
 
     #[test]
